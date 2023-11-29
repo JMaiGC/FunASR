@@ -1,12 +1,16 @@
-import os
-import torch
-import random
-import logging
-import numpy as np
+import json
+from typing import Union, Dict
 from pathlib import Path
-from typing import Union, Dict, List
+from typeguard import check_argument_types
+
+import os
+import logging
+import torch
+
 from funasr.export.models import get_model
-from funasr.utils.types import str2bool, str2triple_str
+import numpy as np
+import random
+from funasr.utils.types import str2bool
 # torch_version = float(".".join(torch.__version__.split(".")[:2]))
 # assert torch_version > 1.9
 
@@ -20,8 +24,8 @@ class ModelExport:
         fallback_num: int = 0,
         audio_in: str = None,
         calib_num: int = 200,
-        model_revision: str = None,
     ):
+        assert check_argument_types()
         self.set_all_random_seed(0)
 
         self.cache_dir = cache_dir
@@ -37,7 +41,6 @@ class ModelExport:
         self.frontend = None
         self.audio_in = audio_in
         self.calib_num = calib_num
-        self.model_revision = model_revision
         
 
     def _export(
@@ -52,26 +55,32 @@ class ModelExport:
 
         # export encoder1
         self.export_config["model_name"] = "model"
-        model = get_model(
+        model_whole = get_model(
             model,
             self.export_config,
         )
-        if isinstance(model, List):
-            for m in model:
-                m.eval()
-                if self.onnx:
-                    self._export_onnx(m, verbose, export_dir)
-                else:
-                    self._export_torchscripts(m, verbose, export_dir)
-                print("output dir: {}".format(export_dir))
+        self.export_config["model_name"] = "model_encoder"
+        model_encoder = get_model(
+            model,
+            self.export_config,
+        )
+        self.export_config["model_name"] = "model_stride_conv"
+        model_stride_conv = get_model(
+            model,
+            self.export_config,
+        )
+        model_whole.eval()
+        model_encoder.eval()
+        model_stride_conv.eval()
+        # self._export_onnx(model, verbose, export_dir)
+        if self.onnx:
+            self._export_onnx(model_whole, verbose, export_dir)
+            self._export_onnx(model_encoder, verbose, export_dir)
+            self._export_onnx(model_stride_conv, verbose, export_dir)
         else:
-            model.eval()
-            # self._export_onnx(model, verbose, export_dir)
-            if self.onnx:
-                self._export_onnx(model, verbose, export_dir)
-            else:
-                self._export_torchscripts(model, verbose, export_dir)
-            print("output dir: {}".format(export_dir))
+            self._export_torchscripts(model, verbose, export_dir)
+
+        print("output dir: {}".format(export_dir))
 
 
     def _torch_quantize(self, model):
@@ -176,8 +185,8 @@ class ModelExport:
         model_dir = tag_name
         if model_dir.startswith('damo'):
             from modelscope.hub.snapshot_download import snapshot_download
-            model_dir = snapshot_download(model_dir, cache_dir=self.cache_dir, revision=self.model_revision)
-        self.cache_dir = model_dir
+            model_dir = snapshot_download(model_dir, cache_dir=self.cache_dir)
+        # self.cache_dir = model_dir
 
         if mode is None:
             import json
@@ -197,7 +206,6 @@ class ModelExport:
                 config, model_file, cmvn_file, 'cpu'
             )
             self.frontend = model.frontend
-            self.export_config["feats_dim"] = 560
         elif mode.startswith('offline'):
             from funasr.tasks.vad import VADTask
             config = os.path.join(model_dir, 'vad.yaml')
@@ -207,7 +215,8 @@ class ModelExport:
             model, vad_infer_args = VADTask.build_model_from_file(
                 config, model_file, cmvn_file=cmvn_file, device='cpu'
             )
-            self.export_config["feats_dim"] = 400
+            # self.export_config["feats_dim"] = 400
+            self.export_config["feats_dim"] = 80
             self.frontend = model.frontend
         elif mode.startswith('punc'):
             from funasr.tasks.punctuation import PunctuationTask as PUNCTask
@@ -235,13 +244,13 @@ class ModelExport:
         # model_script = torch.jit.script(model)
         model_script = model #torch.jit.trace(model)
         model_path = os.path.join(path, f'{model.model_name}.onnx')
-        # if not os.path.exists(model_path):
+
         torch.onnx.export(
             model_script,
             dummy_input,
             model_path,
             verbose=verbose,
-            opset_version=14,
+            opset_version=11,
             input_names=model.get_input_names(),
             output_names=model.get_output_names(),
             dynamic_axes=model.get_dynamic_axes()
@@ -251,26 +260,24 @@ class ModelExport:
             from onnxruntime.quantization import QuantType, quantize_dynamic
             import onnx
             quant_model_path = os.path.join(path, f'{model.model_name}_quant.onnx')
-            if not os.path.exists(quant_model_path):
-                onnx_model = onnx.load(model_path)
-                nodes = [n.name for n in onnx_model.graph.node]
-                nodes_to_exclude = [m for m in nodes if 'output' in m or 'bias_encoder' in m  or 'bias_decoder' in m]
-                quantize_dynamic(
-                    model_input=model_path,
-                    model_output=quant_model_path,
-                    op_types_to_quantize=['MatMul'],
-                    per_channel=True,
-                    reduce_range=False,
-                    weight_type=QuantType.QUInt8,
-                    nodes_to_exclude=nodes_to_exclude,
-                )
+            onnx_model = onnx.load(model_path)
+            nodes = [n.name for n in onnx_model.graph.node]
+            nodes_to_exclude = [m for m in nodes if 'output' in m]
+            quantize_dynamic(
+                model_input=model_path,
+                model_output=quant_model_path,
+                op_types_to_quantize=['MatMul'],
+                per_channel=True,
+                reduce_range=False,
+                weight_type=QuantType.QUInt8,
+                nodes_to_exclude=nodes_to_exclude,
+            )
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--model-name', type=str, required=True)
-    parser.add_argument('--model-name', type=str, action="append", required=True, default=[])
+    parser.add_argument('--model-name', type=str, required=True)
     parser.add_argument('--export-dir', type=str, required=True)
     parser.add_argument('--type', type=str, default='onnx', help='["onnx", "torch"]')
     parser.add_argument('--device', type=str, default='cpu', help='["cpu", "cuda"]')
@@ -278,7 +285,6 @@ if __name__ == '__main__':
     parser.add_argument('--fallback-num', type=int, default=0, help='amp fallback number')
     parser.add_argument('--audio_in', type=str, default=None, help='["wav", "wav.scp"]')
     parser.add_argument('--calib_num', type=int, default=200, help='calib max num')
-    parser.add_argument('--model_revision', type=str, default=None, help='model_revision')
     args = parser.parse_args()
 
     export_model = ModelExport(
@@ -289,8 +295,6 @@ if __name__ == '__main__':
         fallback_num=args.fallback_num,
         audio_in=args.audio_in,
         calib_num=args.calib_num,
-        model_revision=args.model_revision,
     )
-    for model_name in args.model_name:
-        print("export model: {}".format(model_name))
-        export_model.export(model_name)
+    # export_model.export(args.model_name)
+    export_model.export(args.model_name, 'offline')
