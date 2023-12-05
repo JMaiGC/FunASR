@@ -1,10 +1,13 @@
 from enum import Enum
-from typing import List, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 import torch
 from torch import nn
 import math
-from funasr.models.encoder.fsmn_encoder import FSMN
+import time
+from funasr.models.encoder.fsmn_encoder import DFSMN, FSMN
+from funasr.models.encoder.abs_encoder import AbsEncoder
+from funasr.models.encoder.sanm_encoder import SANMEncoder, SANMEncoderChunkOpt
 from funasr.models.base_model import FunASRModel
 
 
@@ -72,6 +75,7 @@ class VADXOptions:
             output_frame_probs: bool = False,
             frame_in_ms: int = 10,
             frame_length_ms: int = 25,
+            **kwargs
     ):
         self.sample_rate = sample_rate
         self.detect_mode = detect_mode
@@ -218,14 +222,25 @@ class E2EVadModel(FunASRModel):
     Deep-FSMN for Large Vocabulary Continuous Speech Recognition
     https://arxiv.org/abs/1803.05030
     """
-    def __init__(self, encoder: FSMN, vad_post_args: Dict[str, Any], frontend=None):
+    def __init__(self, encoder: torch.nn.Module, vad_post_args: Dict[str, Any], stride_conv=None, frontend=None):
         super(E2EVadModel, self).__init__()
         self.vad_opts = VADXOptions(**vad_post_args)
         self.windows_detector = WindowDetector(self.vad_opts.window_size_ms,
                                                self.vad_opts.sil_to_speech_time_thres,
                                                self.vad_opts.speech_to_sil_time_thres,
                                                self.vad_opts.frame_in_ms)
+        self.stride_conv = stride_conv
         self.encoder = encoder
+        enc_dim = self.encoder.output_size()
+        self.point_linear_layer=torch.nn.Linear(enc_dim, enc_dim)
+        self.vad_linear_layer=torch.nn.Linear(enc_dim, enc_dim)
+
+        self.leaky_relu=torch.nn.LeakyReLU(0.1)
+
+        self.point_classifier = torch.nn.Linear(enc_dim, vad_post_args.get('point_output_size', 3))
+        self.classifier = torch.nn.Linear(enc_dim, vad_post_args.get('vad_output_size', 2))
+        self.softmax = torch.nn.Softmax(dim=-1)
+
         # init variables
         self.data_buf_start_frame = 0
         self.frm_cnt = 0
@@ -248,6 +263,8 @@ class E2EVadModel(FunASRModel):
         self.max_end_sil_frame_cnt_thresh = self.vad_opts.max_end_silence_time - self.vad_opts.speech_to_sil_time_thres
         self.speech_noise_thres = self.vad_opts.speech_noise_thres
         self.scores = None
+        self.scores_ = None
+        self.point_scores = None
         self.max_time_out = False
         self.decibel = []
         self.data_buf = None
@@ -255,7 +272,12 @@ class E2EVadModel(FunASRModel):
         self.waveform = None
         self.frontend = frontend
         self.last_drop_frames = 0
+        self.latency = []
+        self.result = []
+        self.is_point1_num = 0
+        self.is_point2_num = 0
 
+        
     def AllResetDetection(self):
         self.data_buf_start_frame = 0
         self.frm_cnt = 0
@@ -278,6 +300,8 @@ class E2EVadModel(FunASRModel):
         self.max_end_sil_frame_cnt_thresh = self.vad_opts.max_end_silence_time - self.vad_opts.speech_to_sil_time_thres
         self.speech_noise_thres = self.vad_opts.speech_noise_thres
         self.scores = None
+        self.scores_ = None
+        self.point_scores = None
         self.max_time_out = False
         self.decibel = []
         self.data_buf = None
@@ -285,6 +309,8 @@ class E2EVadModel(FunASRModel):
         self.waveform = None
         self.last_drop_frames = 0
         self.windows_detector.Reset()
+        self.latency = []
+        self.result = []
 
     def ResetDetection(self):
         self.continous_silence_frame_count = 0
@@ -319,15 +345,62 @@ class E2EVadModel(FunASRModel):
                 10 * math.log10((self.waveform[0][offset: offset + frame_sample_length]).square().sum() + \
                                 0.000001))
 
-    def ComputeScores(self, feats: torch.Tensor, in_cache: Dict[str, torch.Tensor]) -> None:
-        scores = self.encoder(feats, in_cache).to('cpu')  # return B * T * D
+    #def ComputeScores(self, feats: torch.Tensor, in_cache: Dict[str, torch.Tensor]) -> None:
+    def ComputeScores(self, feats: torch.Tensor, feats_len: torch.tensor) -> None:
+        s = time.perf_counter()
+        #print("ori feats")
+        #for i in feats[0]:
+        #    print(i)
+
+        #print("input_features_chunk0")
+        #for i in feats[0, 0:240,:]:
+        #    print(i)
+        #for n in range(1, 10):
+        #    print(f"input_features_chunk{n}")
+        #    start = 180 + 210 * (n - 1) 
+        #    for i in feats[0, start:start+270, :]:
+        #        print(i)
+        if self.stride_conv is not None:
+            feats, feats_len = self.stride_conv(feats, feats_len)
+            #print("featsfeats")
+            #for i in feats[0]:
+            #    print(i)
+        encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_len) #.to('cpu')  # return B * T * D
+        #print("encoder out")
+        #for i in encoder_out[0]:
+        #    print(i)
+        #    print(encoder_out_lens)
+        encoder_out, encoder_out_lens = self.encoder.overlap_chunk_cls.remove_chunk(encoder_out, encoder_out_lens, chunk_outs=None)
+        point_hid_out = self.point_linear_layer(encoder_out)
+        point_out = self.leaky_relu(point_hid_out)
+        point_out = self.point_classifier(point_out)
+        point_scores = self.softmax(point_out)
+        #print("point scores")
+        #for i, s in enumerate(point_scores[0]):
+        #    print(f"point_score_frame{i}:{s}")
+        vad_out = self.vad_linear_layer(encoder_out + point_hid_out)
+        vad_out = self.leaky_relu(vad_out)
+        vad_out = self.classifier(vad_out)
+        scores =  self.softmax(vad_out)
+        #print("vad scores")
+        #for s in scores[0]:
+        #    print(s)
+        
+        #score_chunks = scores[0].split(105, dim=0)
+        #for n,score_chunk in enumerate(score_chunks):
+        #    print(f"vad scores_chunk{n}")
+        #    for i, score_f in enumerate(score_chunk):
+        #        print(f"frame {i} {score_f}")
+
         assert scores.shape[1] == feats.shape[1], "The shape between feats and scores does not match"
         self.vad_opts.nn_eval_block_size = scores.shape[1]
         self.frm_cnt += scores.shape[1]  # count total frames
         if self.scores is None:
             self.scores = scores  # the first calculation
+            self.point_scores = point_scores
         else:
             self.scores = torch.cat((self.scores, scores), dim=1)
+            self.point_scores = torch.cat((self.point_scores, point_scores), dim=1)
 
     def PopDataBufTillFrame(self, frame_idx: int) -> None:  # need check again
         while self.data_buf_start_frame < frame_idx:
@@ -452,6 +525,8 @@ class E2EVadModel(FunASRModel):
             assert len(self.scores) == 1  # 只支持batch_size = 1的测试
             sil_pdf_scores = [self.scores[0][t][sil_pdf_id] for sil_pdf_id in self.sil_pdf_ids]
             sum_score = sum(sil_pdf_scores)
+            #print(f"frame {self.scores[0][t][0]}")
+            print(f"frame {t} {sum_score} {1.0 - sum_score}")
             noise_prob = math.log(sum_score) * self.vad_opts.speech_2_noise_ratio
             total_score = 1.0
             sum_score = total_score - sum_score
@@ -479,14 +554,14 @@ class E2EVadModel(FunASRModel):
 
         return frame_state
 
-    def forward(self, feats: torch.Tensor, waveform: torch.tensor, in_cache: Dict[str, torch.Tensor] = dict(),
+    def forward(self, feats: torch.Tensor, feats_len: torch.Tensor, waveform: torch.Tensor, in_cache: Dict[str, torch.Tensor] = dict(),
                 is_final: bool = False
                 ) -> Tuple[List[List[List[int]]], Dict[str, torch.Tensor]]:
         if not in_cache:
             self.AllResetDetection()
         self.waveform = waveform  # compute decibel for each frame
         self.ComputeDecibel()
-        self.ComputeScores(feats, in_cache)
+        self.ComputeScores(feats, feats_len)
         if not is_final:
             self.DetectCommonFrames()
         else:
@@ -507,9 +582,11 @@ class E2EVadModel(FunASRModel):
         if is_final:
             # reset class variables and clear the dict for the next query
             self.AllResetDetection()
+        #print('is_point1 num:', self.is_point1_num)
+        #print('is_point2 num:', self.is_point2_num)
         return segments, in_cache
 
-    def forward_online(self, feats: torch.Tensor, waveform: torch.tensor, in_cache: Dict[str, torch.Tensor] = dict(),
+    def forward_online(self, feats: torch.Tensor, feats_len: torch.Tensor, waveform: torch.Tensor, in_cache: Dict[str, torch.Tensor] = dict(),
                        is_final: bool = False, max_end_sil: int = 800
                        ) -> Tuple[List[List[List[int]]], Dict[str, torch.Tensor]]:
         if not in_cache:
@@ -517,7 +594,7 @@ class E2EVadModel(FunASRModel):
         self.max_end_sil_frame_cnt_thresh = max_end_sil - self.vad_opts.speech_to_sil_time_thres
         self.waveform = waveform  # compute decibel for each frame
 
-        self.ComputeScores(feats, in_cache)
+        self.ComputeScores(feats, feats_len)
         self.ComputeDecibel()
         if not is_final:
             self.DetectCommonFrames()
@@ -583,6 +660,37 @@ class E2EVadModel(FunASRModel):
             tmp_cur_frm_state = FrameState.kFrameStateSil
         state_change = self.windows_detector.DetectOneFrame(tmp_cur_frm_state, cur_frm_idx)
         frm_shift_in_ms = self.vad_opts.frame_in_ms
+
+        is_point1 = False
+        is_point2 = False
+        # import ipdb;ipdb.set_trace()
+        #if cur_frm_idx >= 7 and tmp_cur_frm_state == FrameState.kFrameStateSil:
+        if cur_frm_idx >= 7 and tmp_cur_frm_state == FrameState.kFrameStateSil:
+            # import ipdb;ipdb.set_trace()
+            point_num1 = 0
+            point_num2 = 0
+            if self.point_scores[:, cur_frm_idx, -1] + self.point_scores[:, cur_frm_idx, -2] > self.point_scores[:, cur_frm_idx, 0]:
+                for i in range(cur_frm_idx - 7, cur_frm_idx + 1):
+                #if self.point_scores[:, i, -1] + self.point_scores[:, i, -2] > self.point_scores[:, i, 0]:
+                    #if self.point_scores[:, cur_frm_idx, -2] >= self.point_scores[:, cur_frm_idx, -1]:
+                    if self.point_scores[:, i, -2] >= self.point_scores[:, i, -1]:
+                        point_num1 += 1
+                    else:
+                        point_num2 += 1
+            if point_num1 >= 3:
+                is_point1 = True
+            if point_num2 >= 3:
+                is_point2 = True
+
+        is_ep = False
+        # if cur_frm_idx >= 7 and tmp_cur_frm_state == FrameState.kFrameStateSil:
+            # ep_num = 0
+            # for i in range(cur_frm_idx - 9, cur_frm_idx + 1):
+                # if self.scores_[:, cur_frm_idx, 2] >= self.scores_[:, cur_frm_idx, 1]:
+                    # ep_num += 1
+            # if ep_num >= 6:
+                # is_ep = True
+
         if AudioChangeState.kChangeStateSil2Speech == state_change:
             silence_frame_count = self.continous_silence_frame_count
             self.continous_silence_frame_count = 0
@@ -652,24 +760,59 @@ class E2EVadModel(FunASRModel):
                     if cur_frm_idx >= self.LatencyFrmNumAtStartPoint():
                         self.OnSilenceDetected(cur_frm_idx - self.LatencyFrmNumAtStartPoint())
             elif self.vad_state_machine == VadStateMachine.kVadInStateInSpeechSegment:
-                if self.continous_silence_frame_count * frm_shift_in_ms >= self.max_end_sil_frame_cnt_thresh:
-                    lookback_frame = int(self.max_end_sil_frame_cnt_thresh / frm_shift_in_ms)
+                if is_ep:
+                    lookback_frame = int(self.continous_silence_frame_count)
                     if self.vad_opts.do_extend:
                         lookback_frame -= int(self.vad_opts.lookahead_time_end_point / frm_shift_in_ms)
                         lookback_frame -= 1
                         lookback_frame = max(0, lookback_frame)
                     self.OnVoiceEnd(cur_frm_idx - lookback_frame, False, False)
+                    self.result.append([str(cur_frm_idx), str(self.continous_silence_frame_count * frm_shift_in_ms + self.vad_opts.speech_to_sil_time_thres), '0'])
+                    self.latency.append(self.continous_silence_frame_count * frm_shift_in_ms + self.vad_opts.speech_to_sil_time_thres)
                     self.vad_state_machine = VadStateMachine.kVadInStateEndPointDetected
-                elif cur_frm_idx - self.confirmed_start_frame + 1 > \
-                        self.vad_opts.max_single_segment_time / frm_shift_in_ms:
-                    self.OnVoiceEnd(cur_frm_idx, False, False)
+                elif is_point1 and self.continous_silence_frame_count >= 6:
+                    self.is_point1_num += 1
+                    lookback_frame = int(self.continous_silence_frame_count)
+                    if self.vad_opts.do_extend:
+                        lookback_frame -= int(self.vad_opts.lookahead_time_end_point / frm_shift_in_ms)
+                        lookback_frame -= 1
+                        lookback_frame = max(0, lookback_frame)
+                    self.OnVoiceEnd(cur_frm_idx - lookback_frame, False, False)
+                    self.result.append([str(cur_frm_idx), str(self.continous_silence_frame_count * frm_shift_in_ms + self.vad_opts.speech_to_sil_time_thres), '1'])
+                    self.latency.append(self.continous_silence_frame_count * frm_shift_in_ms + self.vad_opts.speech_to_sil_time_thres)
                     self.vad_state_machine = VadStateMachine.kVadInStateEndPointDetected
-                elif self.vad_opts.do_extend and not is_final_frame:
-                    if self.continous_silence_frame_count <= int(
-                            self.vad_opts.lookahead_time_end_point / frm_shift_in_ms):
-                        self.OnVoiceDetected(cur_frm_idx)
+                elif is_point2 and self.continous_silence_frame_count >= 12:
+                    self.is_point2_num += 1
+                    lookback_frame = int(self.continous_silence_frame_count)
+                    if self.vad_opts.do_extend:
+                        lookback_frame -= int(self.vad_opts.lookahead_time_end_point / frm_shift_in_ms)
+                        lookback_frame -= 1
+                        lookback_frame = max(0, lookback_frame)
+                    self.OnVoiceEnd(cur_frm_idx - lookback_frame, False, False)
+                    self.result.append([str(cur_frm_idx), str(self.continous_silence_frame_count * frm_shift_in_ms + self.vad_opts.speech_to_sil_time_thres), '2'])
+                    self.latency.append(self.continous_silence_frame_count*frm_shift_in_ms+self.vad_opts.speech_to_sil_time_thres)
+                    self.vad_state_machine = VadStateMachine.kVadInStateEndPointDetected
                 else:
-                    self.MaybeOnVoiceEndIfLastFrame(is_final_frame, cur_frm_idx)
+                    if self.continous_silence_frame_count * frm_shift_in_ms >= self.max_end_sil_frame_cnt_thresh:
+                        lookback_frame = int(self.max_end_sil_frame_cnt_thresh / frm_shift_in_ms)
+                        if self.vad_opts.do_extend:
+                            lookback_frame -= int(self.vad_opts.lookahead_time_end_point / frm_shift_in_ms)
+                            lookback_frame -= 1
+                            lookback_frame = max(0, lookback_frame)
+                        self.OnVoiceEnd(cur_frm_idx - lookback_frame, False, False)
+                        self.result.append([str(cur_frm_idx), str(self.vad_opts.max_end_silence_time), '3'])
+                        self.latency.append(self.vad_opts.max_end_silence_time)
+                        self.vad_state_machine = VadStateMachine.kVadInStateEndPointDetected
+                    elif cur_frm_idx - self.confirmed_start_frame + 1 > \
+                            self.vad_opts.max_single_segment_time / frm_shift_in_ms:
+                        self.OnVoiceEnd(cur_frm_idx, False, False)
+                        self.vad_state_machine = VadStateMachine.kVadInStateEndPointDetected
+                    elif self.vad_opts.do_extend and not is_final_frame:
+                        if self.continous_silence_frame_count <= int(
+                                self.vad_opts.lookahead_time_end_point / frm_shift_in_ms):
+                            self.OnVoiceDetected(cur_frm_idx)
+                    else:
+                        self.MaybeOnVoiceEndIfLastFrame(is_final_frame, cur_frm_idx)
             else:
                 pass
 
